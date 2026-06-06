@@ -1,0 +1,12 @@
+build_stages = [
+  { name = "Prepare exporter", program = "git", args = [
+    "clone",
+    "https://github.com/UBC-iGEM/wiki-2026.git",
+    "."
+  ] },
+  { name = "Prepare environment", program = "cp", args = ["../../.env", ".env"] },
+  { name = "Install dependencies", program = "npm", args = ["install"] },
+  { name = "Export from Notion", program = "npm", args = ["run", "export"] },
+  { name = "Build wiki", program = "npm", args = ["run", "build"] },
+]
+artifact_path = "web/dist"
