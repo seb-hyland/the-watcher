@@ -1,26 +1,31 @@
-use std::path::PathBuf;
+use std::fmt::Display;
 
 use uuid::Uuid;
 
-use crate::{build::BuildEventType, state::STATE};
+use crate::build::BuildEventType;
 
-pub trait UuidFormatExt {
-    fn display(&self) -> String;
-    fn from_display(s: &str) -> Self;
-    fn build_dir(&self) -> PathBuf;
+#[derive(Clone, Copy, PartialEq)]
+pub struct BuildId {
+    inner: Uuid,
 }
 
-impl UuidFormatExt for Uuid {
-    fn display(&self) -> String {
-        base62::encode(self.as_u128())
+impl BuildId {
+    pub fn new() -> Self {
+        Self {
+            inner: Uuid::now_v7(),
+        }
     }
 
-    fn from_display(s: &str) -> Self {
-        base62::decode(s).map(Uuid::from_u128).unwrap()
+    pub fn parse(s: &str) -> Self {
+        Self {
+            inner: base62::decode(s).map(Uuid::from_u128).unwrap(),
+        }
     }
+}
 
-    fn build_dir(&self) -> PathBuf {
-        STATE.config.build_dir.join(self.display())
+impl Display for BuildId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", base62::encode(self.inner.as_u128()))
     }
 }
 

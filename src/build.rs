@@ -1,210 +1,276 @@
 use std::{
     fs::OpenOptions,
     io::Write,
-    ops::Deref,
     path::PathBuf,
     process::{ExitStatus, Stdio},
-    sync::{Arc, LazyLock},
+    sync::Arc,
 };
 
-use arc_swap::ArcSwap;
 use async_stream::stream;
 use chrono::{DateTime, Local};
-use futures::{Stream, StreamExt};
+use futures::{
+    Stream, StreamExt,
+    channel::{
+        mpsc::{self},
+        oneshot,
+    },
+    future::OptionFuture,
+};
 use serde::Serialize;
 use tokio::{
     fs::create_dir_all,
     io::{self, AsyncBufReadExt, BufReader},
     process::Command,
-    spawn,
-    sync::broadcast::{self},
+    runtime,
+    sync::broadcast,
+    task::LocalSet,
 };
 use tokio_stream::wrappers::BroadcastStream;
-use uuid::Uuid;
 
 use crate::{
-    config::BuildStage,
-    state::STATE,
-    utils::{UuidFormatExt, log_file_name},
+    config::{BuildStage, WatcherConfig},
+    utils::{BuildId, log_file_name},
 };
 
-pub struct CurrentBuild {
-    inner: ArcSwap<Option<CurrentBuildInfo>>,
+pub const BROADCAST_CHANNEL_SIZE: usize = 250;
+
+pub struct BuildManager {
+    channel: mpsc::Receiver<BuildRequest>,
+    current: Option<CurrentBuild>,
+    last: LastBuild,
 }
 
-static NO_BUILD: LazyLock<Arc<Option<CurrentBuildInfo>>> = LazyLock::new(|| Arc::new(None));
+impl BuildManager {
+    pub async fn initialize(
+        config: Arc<WatcherConfig>,
+    ) -> Result<mpsc::Sender<BuildRequest>, BuildId> {
+        let mut first_build_info = CurrentBuildInfo::with_capacity(config.build_stages.len());
+        let (tx, rx) = broadcast::channel(BROADCAST_CHANNEL_SIZE);
+        let first_build_res = build(first_build_info.id, tx, Arc::clone(&config)).await;
 
-impl Default for CurrentBuild {
-    fn default() -> Self {
-        Self {
-            inner: ArcSwap::new(Arc::clone(&NO_BUILD)),
+        first_build_info.log.stream_from(rx).await;
+        first_build_info
+            .log
+            .dump(config.build_subdirectory_of(first_build_info.id));
+
+        if BuildResult::Failure == first_build_res {
+            return Err(first_build_info.id);
+        }
+
+        let (sender, receiver) = mpsc::channel(BROADCAST_CHANNEL_SIZE);
+        std::thread::spawn(move || {
+            let rt = runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .expect("Failed to start runtime for BuildManager. This is a bug!");
+            let local = LocalSet::new();
+
+            local.block_on(&rt, async {
+                let mut manager = BuildManager {
+                    channel: receiver,
+                    current: None,
+                    last: LastBuild {
+                        id: first_build_info.id,
+                        timestamp: Local::now(),
+                    },
+                };
+
+                loop {
+                    tokio::select! {
+                        Ok(msg) = manager.channel.recv() => {
+                            let run_ctx = RunContext {
+                                manager: &mut manager,
+                                config: Arc::clone(&config),
+                                local_set: &local,
+                            };
+                            msg.run(run_ctx);
+                        },
+                        Some(build_event) = OptionFuture::from(
+                            manager.current.as_mut().map(|cur_build| cur_build.build_channel.recv())
+                        ) => {
+                            use broadcast::error::RecvError;
+
+                            let current = manager
+                                .current
+                                .as_mut()
+                                .expect("No ongoing build while build event received. This is a bug!");
+                            match build_event {
+                                Ok(event) => current.info.log.log_event(event),
+                                Err(RecvError::Lagged(_)) => {},
+                                // Build finished
+                                Err(RecvError::Closed) => {
+                                    manager.last = LastBuild {
+                                        id: current.info.id,
+                                        timestamp: Local::now(),
+                                    };
+                                    manager.current = None;
+                                },
+                            };
+                        },
+                    }
+                }
+            });
+        });
+
+        Ok(sender)
+    }
+}
+
+pub struct RunContext<'env> {
+    manager: &'env mut BuildManager,
+    config: Arc<WatcherConfig>,
+    local_set: &'env LocalSet,
+}
+
+pub trait RunnableRequest: Sized {
+    type Response;
+    fn into_request(self) -> BuildRequest;
+
+    fn compute_response(&self, ctx: RunContext<'_>) -> Self::Response;
+
+    fn response_channel(self) -> oneshot::Sender<Self::Response>;
+
+    fn run(self, ctx: RunContext<'_>) {
+        let resp = self.compute_response(ctx);
+        let resp_tx = self.response_channel();
+        resp_tx
+            .send(resp)
+            .unwrap_or_else(|_| panic!("Failed to send response to BuildRequest. This is a bug!"));
+    }
+}
+
+pub enum BuildRequest {
+    Start(StartBuild),
+    Subscribe(SubscribeBuild),
+    QueryLast(QueryLastBuild),
+}
+
+impl BuildRequest {
+    fn run(self, ctx: RunContext<'_>) {
+        match self {
+            BuildRequest::Start(start_build) => start_build.run(ctx),
+            BuildRequest::Subscribe(subscribe_build) => subscribe_build.run(ctx),
+            BuildRequest::QueryLast(query_last_build) => query_last_build.run(ctx),
         }
     }
 }
 
-impl CurrentBuild {
-    pub fn subscribe(&self) -> Option<(Uuid, BuildLog)> {
-        self.inner
-            .load()
-            .as_ref()
-            .as_ref()
-            .map(|build| (build.id, build.log.clone()))
+pub struct StartBuild {
+    pub res_tx: oneshot::Sender<StartBuildResponse>,
+}
+
+type StartBuildResponse = Result<BuildId, BuildId>;
+
+impl RunnableRequest for StartBuild {
+    type Response = StartBuildResponse;
+    fn into_request(self) -> BuildRequest {
+        BuildRequest::Start(self)
     }
 
-    pub fn start_build(&self) -> Result<Uuid, Uuid> {
-        let build_stages = &STATE.config.build_stages;
-        let current_id = Uuid::now_v7();
+    fn compute_response(&self, ctx: RunContext<'_>) -> Self::Response {
+        match &ctx.manager.current {
+            Some(cur_build) => Err(cur_build.info.id),
+            None => {
+                let build_info = CurrentBuildInfo::with_capacity(ctx.config.build_stages.len());
+                let id = build_info.id;
 
-        let log = BuildLog::with_capacity(build_stages.len());
-        let current_build_info = CurrentBuildInfo {
-            id: current_id,
-            log: log.clone(),
-        };
+                let (tx, rx) = broadcast::channel(BROADCAST_CHANNEL_SIZE);
+                ctx.local_set.spawn_local(async move {
+                    build(id, tx, ctx.config).await;
+                });
 
-        let existing_build_info = self
-            .inner
-            .compare_and_swap(&*NO_BUILD, Arc::new(Some(current_build_info)));
-        if let Some(build_info) = &**existing_build_info
-            && build_info.id != current_id
-        {
-            // Was already building
-            return Err(build_info.id);
+                ctx.manager.current = Some(CurrentBuild {
+                    info: build_info,
+                    build_channel: rx,
+                });
+                Ok(id)
+            }
         }
-
-        spawn(build(build_stages, current_id, log));
-        Ok(current_id)
     }
+
+    fn response_channel(self) -> oneshot::Sender<Self::Response> {
+        self.res_tx
+    }
+}
+
+pub struct SubscribeBuild {
+    pub res_tx: oneshot::Sender<SubscribeBuildResponse>,
+}
+
+type SubscribeBuildResponse = Option<(BuildId, BuildLog)>;
+
+impl RunnableRequest for SubscribeBuild {
+    type Response = Option<(BuildId, BuildLog)>;
+    fn into_request(self) -> BuildRequest {
+        BuildRequest::Subscribe(self)
+    }
+
+    fn compute_response(&self, ctx: RunContext<'_>) -> Self::Response {
+        ctx.manager
+            .current
+            .as_ref()
+            .map(|cur_build| (cur_build.info.id, cur_build.info.log.clone()))
+    }
+
+    fn response_channel(self) -> oneshot::Sender<Self::Response> {
+        self.res_tx
+    }
+}
+
+pub struct QueryLastBuild {
+    pub res_tx: oneshot::Sender<LastBuild>,
+}
+
+impl RunnableRequest for QueryLastBuild {
+    type Response = LastBuild;
+    fn into_request(self) -> BuildRequest {
+        BuildRequest::QueryLast(self)
+    }
+
+    fn compute_response(&self, ctx: RunContext<'_>) -> Self::Response {
+        ctx.manager.last
+    }
+
+    fn response_channel(self) -> oneshot::Sender<Self::Response> {
+        self.res_tx
+    }
+}
+
+struct CurrentBuild {
+    info: CurrentBuildInfo,
+    build_channel: broadcast::Receiver<Arc<BuildEvent>>,
 }
 
 struct CurrentBuildInfo {
-    id: Uuid,
+    id: BuildId,
     log: BuildLog,
 }
 
-#[derive(Clone)]
-pub struct BuildLog {
-    history: Arc<ArcSwap<Vec<Arc<BuildEvent>>>>,
-    channel: broadcast::Sender<Arc<BuildEvent>>,
-}
-
-impl BuildLog {
-    pub fn with_capacity(cap: usize) -> Self {
-        let (channel, _) = broadcast::channel::<Arc<BuildEvent>>(100);
-        let history = Arc::new(ArcSwap::from_pointee(Vec::with_capacity(cap)));
-        Self { history, channel }
-    }
-
-    fn log_event(&self, event: BuildEvent) {
-        let event = Arc::new(event);
-
-        let current_history = self.history.load();
-        let mut new_history = (**current_history).clone();
-        new_history.push(event.clone());
-        self.history.store(Arc::new(new_history));
-
-        let _ = self.channel.send(event);
-    }
-
-    pub fn event_stream(self) -> impl Stream<Item = Arc<BuildEvent>> {
-        let mut live_rx = BroadcastStream::new(self.channel.subscribe());
-        let history_snapshot = self.history.load();
-
-        stream! {
-            for event in history_snapshot.iter() {
-                yield Arc::clone(event);
-            }
-            drop(history_snapshot);
-
-            while let Some(result) = live_rx.next().await {
-                match result {
-                    Ok(event) => yield event,
-                    Err(_err) => { break }
-                }
-            }
-        }
-    }
-
-    pub fn dump(&self, dir: PathBuf) {
-        for entry in self.history.load().iter() {
-            let path = log_file_name(entry.stage, entry.ty);
-
-            let _ = OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(dir.join(path))
-                .map(|mut file| {
-                    let _ = file.write_all(entry.payload.as_bytes());
-                    let _ = file.write_all(b"\n");
-                });
-        }
-    }
-}
-
-#[derive(Serialize)]
-pub struct BuildEvent {
-    pub ty: BuildEventType,
-    pub payload: String,
-    pub stage: usize,
-}
-
-#[derive(Clone, Copy, PartialEq, Serialize)]
-pub enum BuildEventType {
-    Message,
-    Error,
-}
-
+#[derive(Clone, Copy)]
 pub struct LastBuild {
-    inner: ArcSwap<LastBuildInfo>,
-}
-
-impl From<LastBuildInfo> for LastBuild {
-    fn from(value: LastBuildInfo) -> Self {
-        Self {
-            inner: ArcSwap::from_pointee(value),
-        }
-    }
-}
-
-impl Deref for LastBuild {
-    type Target = ArcSwap<LastBuildInfo>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-pub struct LastBuildInfo {
-    pub id: Uuid,
+    pub id: BuildId,
     pub timestamp: DateTime<Local>,
 }
 
-#[derive(PartialEq)]
-pub enum BuildResult {
-    Success,
-    Failure,
+impl CurrentBuildInfo {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            id: BuildId::new(),
+            log: BuildLog::with_capacity(cap),
+        }
+    }
 }
 
-pub async fn build(build_stages: &[BuildStage], id: Uuid, log: BuildLog) -> BuildResult {
+async fn build(
+    id: BuildId,
+    channel: broadcast::Sender<Arc<BuildEvent>>,
+    config: Arc<WatcherConfig>,
+) -> BuildResult {
     use BuildEventType::*;
     use BuildResult::*;
 
-    // Sets the current build to `NO_BUILD` when this function returns
-    struct EndBuildGuard<'s> {
-        id: Uuid,
-        log: &'s BuildLog,
-    }
-    impl<'s> Drop for EndBuildGuard<'s> {
-        fn drop(&mut self) {
-            self.log.dump(self.id.build_dir());
-            println!("Finished build");
-            STATE.current_build.inner.store(Arc::clone(&NO_BUILD));
-        }
-    }
-    let _guard = EndBuildGuard { id, log: &log };
+    let build_dir = config.build_dir.join(id.to_string());
 
-    println!("Started build {}", id.display());
-
-    let build_dir = id.build_dir();
     if let Err(e) = create_dir_all(&build_dir).await {
         let event = BuildEvent {
             ty: Error,
@@ -214,11 +280,12 @@ pub async fn build(build_stages: &[BuildStage], id: Uuid, log: BuildLog) -> Buil
             ),
             stage: 0,
         };
-        log.log_event(event);
+        let _ = channel.send(Arc::new(event));
+
         return Failure;
     }
 
-    for (stage_idx, BuildStage { program, args, .. }) in build_stages.iter().enumerate() {
+    for (stage_idx, BuildStage { program, args, .. }) in config.build_stages.iter().enumerate() {
         let child = Command::new(program)
             .args(args)
             .current_dir(&build_dir)
@@ -236,7 +303,7 @@ pub async fn build(build_stages: &[BuildStage], id: Uuid, log: BuildLog) -> Buil
         let mut child = match child {
             Ok(c) => c,
             Err(e) => {
-                log.log_event(e);
+                let _ = channel.send(Arc::new(e));
                 return Failure;
             }
         };
@@ -261,7 +328,7 @@ pub async fn build(build_stages: &[BuildStage], id: Uuid, log: BuildLog) -> Buil
                         payload: line,
                         stage: stage_idx,
                     };
-                    log.log_event(event);
+                    let _ = channel.send(Arc::new(event));
                 }
             };
             let handle_exit = |status: Result<ExitStatus, io::Error>| -> BuildEvent {
@@ -291,8 +358,10 @@ pub async fn build(build_stages: &[BuildStage], id: Uuid, log: BuildLog) -> Buil
                     let exit_event = handle_exit(status);
                     let build_failed = exit_event.ty == Error;
 
-                    log.log_event(exit_event);
-                    if build_failed { return Failure }
+                    let _ = channel.send(Arc::new(exit_event));
+                    if build_failed {
+                        return Failure;
+                    }
 
                     break;
                 }
@@ -300,25 +369,104 @@ pub async fn build(build_stages: &[BuildStage], id: Uuid, log: BuildLog) -> Buil
         }
     }
 
-    let artifact_path = build_dir.join(&STATE.config.artifact_path);
+    let artifact_path = build_dir.join(&config.artifact_path);
     if !artifact_path.exists() {
-        log.log_event(BuildEvent {
+        let err_event = BuildEvent {
             ty: Error,
             payload: format!(
                 "Expected build output at {} does not exist.",
                 artifact_path.display()
             ),
-            stage: build_stages.len() - 1,
-        });
+            stage: config.build_stages.len() - 1,
+        };
+        let _ = channel.send(Arc::new(err_event));
+
         return Failure;
     }
 
-    // Dump logs and clear current build
-    drop(_guard);
-    STATE.last_build.store(Arc::new(LastBuildInfo {
-        id,
-        timestamp: Local::now(),
-    }));
-
     Success
+}
+
+#[derive(PartialEq)]
+pub enum BuildResult {
+    Success,
+    Failure,
+}
+
+#[derive(Clone)]
+pub struct BuildLog {
+    history: Vec<Arc<BuildEvent>>,
+    channel: broadcast::Sender<Arc<BuildEvent>>,
+}
+
+impl BuildLog {
+    pub fn with_capacity(cap: usize) -> Self {
+        let (channel, _) = broadcast::channel::<Arc<BuildEvent>>(BROADCAST_CHANNEL_SIZE);
+        let history = Vec::with_capacity(cap);
+        Self { history, channel }
+    }
+
+    async fn stream_from(&mut self, mut channel: broadcast::Receiver<Arc<BuildEvent>>) {
+        use broadcast::error::RecvError;
+
+        loop {
+            match channel.recv().await {
+                Ok(msg) => self.log_event(msg),
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => break,
+            }
+        }
+    }
+
+    fn log_event(&mut self, event: Arc<BuildEvent>) {
+        self.history.push(Arc::clone(&event));
+        let _ = self.channel.send(event);
+    }
+
+    pub fn event_stream(self) -> impl Stream<Item = Arc<BuildEvent>> {
+        let mut live_rx = BroadcastStream::new(self.channel.subscribe());
+        let history_snapshot = self.history;
+
+        stream! {
+            for event in history_snapshot.iter() {
+                yield Arc::clone(event);
+            }
+            drop(history_snapshot);
+
+            while let Some(result) = live_rx.next().await {
+                match result {
+                    Ok(event) => yield event,
+                    Err(_err) => { break }
+                }
+            }
+        }
+    }
+
+    fn dump(&self, dir: PathBuf) {
+        for entry in self.history.iter() {
+            let path = log_file_name(entry.stage, entry.ty);
+
+            let _ = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(dir.join(path))
+                .map(|mut file| {
+                    let _ = file.write_all(entry.payload.as_bytes());
+                    let _ = file.write_all(b"\n");
+                });
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct BuildEvent {
+    pub ty: BuildEventType,
+    pub payload: String,
+    pub stage: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize)]
+pub enum BuildEventType {
+    Message,
+    Error,
 }

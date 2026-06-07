@@ -3,17 +3,16 @@ use std::{
     fs::File,
     io::Read,
     path::PathBuf,
+    sync::Arc,
 };
 
 use tokio::runtime;
-use uuid::Uuid;
 
-use crate::{build::BuildLog, config::WatcherConfig, state::STATE};
+use crate::{build::BuildManager, config::WatcherConfig, serve::ServerCtx};
 
 mod build;
 mod config;
 mod serve;
-mod state;
 mod utils;
 
 const CONFIG_FILE_NAME: &str = "config.toml";
@@ -49,28 +48,19 @@ fn main() {
     let config: WatcherConfig = toml::from_str(&config_file_string).unwrap_or_else(|e| {
         panic!("Failed to parse config file at {CONFIG_FILE_NAME}. Error: {e}",)
     });
+    let config = Arc::new(config);
 
     let rt = runtime::Builder::new_multi_thread()
         .enable_io()
         .build()
         .unwrap_or_else(|e| panic!("Failed to start Tokio runtime! Error: {e}"));
     rt.block_on(async {
-        let initial_build_id = Uuid::now_v7();
+        let manager_res = BuildManager::initialize(Arc::clone(&config)).await;
+        let request_tx = match manager_res {
+            Ok(channel) => channel,
+            Err(e) => panic!("Initial build failed! Id: {e}"),
+        };
 
-        STATE.initialize(initial_build_id, config);
-
-        let initial_build_log = BuildLog::with_capacity(STATE.config.build_stages.len());
-
-        let build_res = build::build(
-            &STATE.config.build_stages,
-            initial_build_id,
-            initial_build_log,
-        )
-        .await;
-
-        if build_res == build::BuildResult::Failure {
-            panic!("Initial build failed!")
-        }
-        serve::serve().await;
+        serve::serve(ServerCtx { request_tx, config }).await;
     });
 }

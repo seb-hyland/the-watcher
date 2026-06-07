@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::utils::BuildId;
+
 #[derive(Deserialize)]
 pub struct WatcherConfig {
     #[serde(default = "default_ip")]
@@ -34,4 +36,10 @@ fn default_port() -> String {
 
 fn default_build_dir() -> PathBuf {
     PathBuf::from("builds/")
+}
+
+impl WatcherConfig {
+    pub fn build_subdirectory_of(&self, id: BuildId) -> PathBuf {
+        self.build_dir.join(id.to_string())
+    }
 }

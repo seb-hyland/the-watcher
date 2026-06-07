@@ -24,8 +24,6 @@ const scrollToBottom = () => {
 
 let ERROR_OCCURED = false;
 
-type SocketData = SocketMessage | SocketInit;
-
 interface SocketInit {
     ty: "Init";
     is_active: boolean;
@@ -36,6 +34,8 @@ interface SocketMessage {
     payload: string;
     stage: number;
 }
+
+type SocketData = SocketMessage | SocketInit;
 
 socket.onmessage = (event) => {
     const message: SocketData = JSON.parse(event.data);

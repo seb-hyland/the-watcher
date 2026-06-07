@@ -5,36 +5,64 @@ use axum::{
     Router,
     body::Body,
     extract::{
-        Path, WebSocketUpgrade,
+        Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{Request, StatusCode, Uri, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
-use futures::{Stream, StreamExt, future::join_all};
+use futures::{
+    SinkExt, Stream, StreamExt,
+    channel::{mpsc, oneshot},
+    future::join_all,
+};
 use http_body_util::BodyExt;
 use serde::Serialize;
 use tokio::{fs::read_to_string, net::TcpListener};
 use tower::ServiceExt;
 use tower_http::services::ServeDir;
-use uuid::Uuid;
 
 use crate::{
-    build::{BuildEvent, BuildEventType},
-    config::BuildStage,
-    state::STATE,
-    utils::{UuidFormatExt, log_file_name},
+    build::{
+        BuildEvent, BuildEventType, BuildRequest, LastBuild, QueryLastBuild, RunnableRequest,
+        StartBuild, SubscribeBuild,
+    },
+    config::{BuildStage, WatcherConfig},
+    utils::{BuildId, log_file_name},
 };
 
-pub async fn serve() {
+#[derive(Clone)]
+pub struct ServerCtx {
+    pub request_tx: mpsc::Sender<BuildRequest>,
+    pub config: Arc<WatcherConfig>,
+}
+
+impl ServerCtx {
+    async fn make_build_request<R: RunnableRequest>(
+        &mut self,
+        request: impl FnOnce(oneshot::Sender<R::Response>) -> R,
+    ) -> R::Response {
+        let (res_tx, res_rx) = oneshot::channel();
+        self.request_tx
+            .send(request(res_tx).into_request())
+            .await
+            .expect("Failed to send to BuildManager. This is a bug!");
+        res_rx
+            .await
+            .expect("Channel dropped without response. This is a bug!")
+    }
+}
+
+pub async fn serve(ctx: ServerCtx) {
     let server = Router::new()
         .route("/rebuild", get(rebuild_handler))
         .route("/build_{id}", get(build_handler))
         .route("/build_{id}/ws", get(build_ws_handler))
-        .fallback(serve_dir);
+        .fallback(serve_dir)
+        .with_state(ctx.clone());
 
-    let addr = format!("{}:{}", STATE.config.ip, STATE.config.port);
+    let addr = format!("{}:{}", ctx.config.ip, ctx.config.port);
     let listener = TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("Failed to open listener at {addr} due to {e}"));
@@ -45,16 +73,17 @@ pub async fn serve() {
         .unwrap_or_else(|e| panic!("Failed to start server at {addr} due to {e}"));
 }
 
-async fn rebuild_handler() -> Response {
-    let id = match STATE.current_build.start_build() {
+async fn rebuild_handler(State(mut ctx): State<ServerCtx>) -> Response {
+    let response = ctx.make_build_request(|res_tx| StartBuild { res_tx }).await;
+    let id = match response {
         Ok(id) => id,
         Err(id) => id,
     };
-    Redirect::to(&format!("/build_{}", id.display())).into_response()
+    Redirect::to(&format!("/build_{}", id)).into_response()
 }
 
-async fn build_handler(Path(id): Path<String>) -> Response {
-    let log_divs = STATE
+async fn build_handler(Path(id): Path<String>, State(ctx): State<ServerCtx>) -> Response {
+    let log_divs = ctx
         .config
         .build_stages
         .iter()
@@ -80,16 +109,23 @@ async fn build_handler(Path(id): Path<String>) -> Response {
     Html::from(document).into_response()
 }
 
-async fn build_ws_handler(Path(id): Path<String>, ws: WebSocketUpgrade) -> Response {
+async fn build_ws_handler(
+    Path(id): Path<String>,
+    State(mut ctx): State<ServerCtx>,
+    ws: WebSocketUpgrade,
+) -> Response {
     #[derive(Serialize)]
     struct WsInitMessage {
         ty: &'static str,
         is_active: bool,
     }
 
-    let id = Uuid::from_display(&id);
+    let id = BuildId::parse(&id);
+    let response = ctx
+        .make_build_request(|res_tx| SubscribeBuild { res_tx })
+        .await;
 
-    if let Some((cur_id, log)) = STATE.current_build.subscribe()
+    if let Some((cur_id, log)) = response
         && cur_id == id
     {
         return ws.on_upgrade(async |mut socket| {
@@ -103,7 +139,7 @@ async fn build_ws_handler(Path(id): Path<String>, ws: WebSocketUpgrade) -> Respo
         });
     }
 
-    let build_dir = id.build_dir();
+    let build_dir = ctx.config.build_subdirectory_of(id);
     if !build_dir.exists() {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -115,7 +151,7 @@ async fn build_ws_handler(Path(id): Path<String>, ws: WebSocketUpgrade) -> Respo
         };
         send_ws(&mut socket, &init_msg).await;
 
-        let (msg_futures, err_futures): (Vec<_>, Vec<_>) = (0..STATE.config.build_stages.len())
+        let (msg_futures, err_futures): (Vec<_>, Vec<_>) = (0..ctx.config.build_stages.len())
             .map(|idx| {
                 let msg_path = build_dir.join(log_file_name(idx, BuildEventType::Message));
                 let err_path = build_dir.join(log_file_name(idx, BuildEventType::Error));
@@ -164,9 +200,13 @@ async fn send_ws(socket: &mut WebSocket, data: &impl Serialize) {
         .await;
 }
 
-async fn serve_dir(uri: Uri) -> Response {
-    let last_build_dir = STATE.last_build.load().id.build_dir();
-    let artifact_path = last_build_dir.join(&STATE.config.artifact_path);
+async fn serve_dir(uri: Uri, State(mut ctx): State<ServerCtx>) -> Response {
+    let LastBuild { id, timestamp } = ctx
+        .make_build_request(|res_tx| QueryLastBuild { res_tx })
+        .await;
+
+    let last_build_dir = ctx.config.build_subdirectory_of(id);
+    let artifact_path = last_build_dir.join(&ctx.config.artifact_path);
 
     let service = ServeDir::new(artifact_path);
     let req = Request::builder()
@@ -191,20 +231,17 @@ async fn serve_dir(uri: Uri) -> Response {
     let body_bytes = collected_body.to_bytes();
     let html_content = String::from_utf8_lossy(&body_bytes);
 
-    let cur_build_id = STATE.last_build.load().id.display();
-    let banner_msg = if let Some((new_build_id, _)) = STATE.current_build.subscribe() {
-        let new_build_id = new_build_id.display();
+    let current_build = ctx
+        .make_build_request(|res_tx| SubscribeBuild { res_tx })
+        .await;
+    let banner_msg = if let Some((new_build_id, _)) = current_build {
         format!(
-            r#"You are viewing build {cur_build_id}. A rebuild is in process; <a href="build_{new_build_id}">click here</a> to see its status."#,
+            r#"You are viewing build {id}. A rebuild is in process; <a href="build_{new_build_id}">click here</a> to see its status."#,
         )
     } else {
         format!(
-            r#"You are viewing build {cur_build_id}, which occurred at {last_build_time}. To rebuild, click <a target="blank" href="/rebuild">here</a>."#,
-            last_build_time = STATE
-                .last_build
-                .load()
-                .timestamp
-                .format("%B %d at %I:%M %p (%Z)"),
+            r#"You are viewing build {id}, which finished at {last_build_time}. To rebuild, click <a target="blank" href="/rebuild">here</a>."#,
+            last_build_time = timestamp.format("%B %d at %I:%M %p (%Z)"),
         )
     };
     let header_element = format!(
