@@ -1,3 +1,8 @@
+import { AnsiUp } from "./ansi_up";
+
+const ansi_up = new AnsiUp();
+ansi_up.escapeForHtml = true;
+
 const current_path = window.location.pathname;
 const ws_protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 
@@ -52,7 +57,9 @@ socket.onmessage = (event) => {
             const logs_elem = document.getElementById(
                 `log-messages-${message.stage}`,
             )! as HTMLPreElement;
-            logs_elem.textContent += "\n" + message.payload;
+
+            const html_payload = ansi_up.ansi_to_html(message.payload);
+            logs_elem.innerHTML += "\n" + html_payload;
 
             scrollToBottom();
             break;

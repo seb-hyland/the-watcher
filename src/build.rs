@@ -37,26 +37,13 @@ pub const BROADCAST_CHANNEL_SIZE: usize = 250;
 pub struct BuildManager {
     channel: mpsc::Receiver<BuildRequest>,
     current: Option<CurrentBuild>,
-    last: LastBuild,
+    last: Option<LastBuild>,
 }
 
 impl BuildManager {
     pub async fn initialize(
         config: Arc<WatcherConfig>,
     ) -> Result<mpsc::Sender<BuildRequest>, BuildId> {
-        let mut first_build_info = CurrentBuildInfo::with_capacity(config.build_stages.len());
-        let (tx, rx) = broadcast::channel(BROADCAST_CHANNEL_SIZE);
-        let first_build_res = build(first_build_info.id, tx, Arc::clone(&config)).await;
-
-        first_build_info.log.stream_from(rx).await;
-        first_build_info
-            .log
-            .dump(config.build_subdirectory_of(first_build_info.id));
-
-        if BuildResult::Failure == first_build_res {
-            return Err(first_build_info.id);
-        }
-
         let (sender, receiver) = mpsc::channel(BROADCAST_CHANNEL_SIZE);
         std::thread::spawn(move || {
             let rt = runtime::Builder::new_current_thread()
@@ -69,10 +56,7 @@ impl BuildManager {
                 let mut manager = BuildManager {
                     channel: receiver,
                     current: None,
-                    last: LastBuild {
-                        id: first_build_info.id,
-                        timestamp: Local::now(),
-                    },
+                    last: None,
                 };
 
                 loop {
@@ -99,10 +83,15 @@ impl BuildManager {
                                 Err(RecvError::Lagged(_)) => {},
                                 // Build finished
                                 Err(RecvError::Closed) => {
-                                    manager.last = LastBuild {
+                                    if manager.last.is_none() {
+                                        println!("Server initialized: first build complete at {id}", id = current.info.id);
+                                    }
+
+                                    manager.last = Some(LastBuild {
                                         id: current.info.id,
                                         timestamp: Local::now(),
-                                    };
+                                    });
+                                    current.info.log.dump(config.build_subdirectory_of(current.info.id));
                                     manager.current = None;
                                 },
                             };
@@ -218,11 +207,13 @@ impl RunnableRequest for SubscribeBuild {
 }
 
 pub struct QueryLastBuild {
-    pub res_tx: oneshot::Sender<LastBuild>,
+    pub res_tx: oneshot::Sender<QueryLastBuildResponse>,
 }
 
+type QueryLastBuildResponse = Option<LastBuild>;
+
 impl RunnableRequest for QueryLastBuild {
-    type Response = LastBuild;
+    type Response = QueryLastBuildResponse;
     fn into_request(self) -> BuildRequest {
         BuildRequest::QueryLast(self)
     }
@@ -404,18 +395,6 @@ impl BuildLog {
         let (channel, _) = broadcast::channel::<Arc<BuildEvent>>(BROADCAST_CHANNEL_SIZE);
         let history = Vec::with_capacity(cap);
         Self { history, channel }
-    }
-
-    async fn stream_from(&mut self, mut channel: broadcast::Receiver<Arc<BuildEvent>>) {
-        use broadcast::error::RecvError;
-
-        loop {
-            match channel.recv().await {
-                Ok(msg) => self.log_event(msg),
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => break,
-            }
-        }
     }
 
     fn log_event(&mut self, event: Arc<BuildEvent>) {

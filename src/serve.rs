@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fmt::Display, sync::Arc};
 
 use async_stream::stream;
 use axum::{
@@ -103,7 +103,7 @@ async fn build_handler(Path(id): Path<String>, State(ctx): State<ServerCtx>) -> 
         include_str!("web/build.html"),
         id = id,
         log_divs = log_divs,
-        log_js = include_str!(concat!(env!("OUT_DIR"), "/web_js/build_log.js"))
+        bundle_js = include_str!(concat!(env!("OUT_DIR"), "/bundle.js")),
     );
 
     Html::from(document).into_response()
@@ -201,9 +201,13 @@ async fn send_ws(socket: &mut WebSocket, data: &impl Serialize) {
 }
 
 async fn serve_dir(uri: Uri, State(mut ctx): State<ServerCtx>) -> Response {
-    let LastBuild { id, timestamp } = ctx
+    let response = ctx
         .make_build_request(|res_tx| QueryLastBuild { res_tx })
         .await;
+    let Some(LastBuild { id, timestamp }) = response else {
+        // Still initializing! Redirect will send it to the build.
+        return Redirect::to("/rebuild").into_response();
+    };
 
     let last_build_dir = ctx.config.build_subdirectory_of(id);
     let artifact_path = last_build_dir.join(&ctx.config.artifact_path);
@@ -234,14 +238,25 @@ async fn serve_dir(uri: Uri, State(mut ctx): State<ServerCtx>) -> Response {
     let current_build = ctx
         .make_build_request(|res_tx| SubscribeBuild { res_tx })
         .await;
+
+    fn anchor_generator(link: impl Display, text: impl Display) -> String {
+        format!(r#"<a target="blank" href="{link}">{text}</a>"#)
+    }
+    fn build_link_generator(id: BuildId, text: impl Display) -> String {
+        anchor_generator(format!("/build_{id}"), text)
+    }
+    let cur_build_link = build_link_generator(id, format!("build {id}"));
+
     let banner_msg = if let Some((new_build_id, _)) = current_build {
         format!(
-            r#"You are viewing build {id}. A rebuild is in process; <a href="build_{new_build_id}">click here</a> to see its status."#,
+            r#"You are viewing {cur_build_link}. A rebuild is in process; {new_build_link} to see its status."#,
+            new_build_link = build_link_generator(new_build_id, "click here"),
         )
     } else {
         format!(
-            r#"You are viewing build {id}, which finished at {last_build_time}. To rebuild, click <a target="blank" href="/rebuild">here</a>."#,
+            r#"You are viewing {cur_build_link}, which finished at {last_build_time}. To rebuild, click {rebuild_link}."#,
             last_build_time = timestamp.format("%B %d at %I:%M %p (%Z)"),
+            rebuild_link = anchor_generator("/rebuild", "here"),
         )
     };
     let header_element = format!(

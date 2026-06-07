@@ -5,8 +5,14 @@ build_stages = [
     "."
   ] },
   { name = "Prepare environment", program = "cp", args = ["../../.env", ".env"] },
-  { name = "Install dependencies", program = "npm", args = ["install"] },
+  { name = "Install dependencies", program = "npm", args = [
+    "install",
+    "--color=always"
+  ] },
   { name = "Export from Notion", program = "npm", args = ["run", "export"] },
-  { name = "Build wiki", program = "npm", args = ["run", "build"] },
+  { name = "Build wiki", program = "sh", args = [
+    "-c",
+    "FORCE_COLOR=1 npm run build"
+  ] },
 ]
 artifact_path = "web/dist"
