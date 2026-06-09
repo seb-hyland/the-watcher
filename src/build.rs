@@ -21,9 +21,8 @@ use tokio::{
     fs::create_dir_all,
     io::{self, AsyncBufReadExt, BufReader},
     process::Command,
-    runtime,
+    spawn,
     sync::broadcast,
-    task::LocalSet,
 };
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -45,60 +44,51 @@ impl BuildManager {
         config: Arc<WatcherConfig>,
     ) -> Result<mpsc::Sender<BuildRequest>, BuildId> {
         let (sender, receiver) = mpsc::channel(BROADCAST_CHANNEL_SIZE);
-        std::thread::spawn(move || {
-            let rt = runtime::Builder::new_current_thread()
-                .enable_io()
-                .build()
-                .expect("Failed to start runtime for BuildManager. This is a bug!");
-            let local = LocalSet::new();
+        spawn(async move {
+            let mut manager = BuildManager {
+                channel: receiver,
+                current: None,
+                last: None,
+            };
 
-            local.block_on(&rt, async {
-                let mut manager = BuildManager {
-                    channel: receiver,
-                    current: None,
-                    last: None,
-                };
+            loop {
+                tokio::select! {
+                    Ok(msg) = manager.channel.recv() => {
+                        let run_ctx = RunContext {
+                            manager: &mut manager,
+                            config: Arc::clone(&config),
+                        };
+                        msg.run(run_ctx);
+                    },
+                    Some(build_event) = OptionFuture::from(
+                        manager.current.as_mut().map(|cur_build| cur_build.build_channel.recv())
+                    ) => {
+                        use broadcast::error::RecvError;
 
-                loop {
-                    tokio::select! {
-                        Ok(msg) = manager.channel.recv() => {
-                            let run_ctx = RunContext {
-                                manager: &mut manager,
-                                config: Arc::clone(&config),
-                                local_set: &local,
-                            };
-                            msg.run(run_ctx);
-                        },
-                        Some(build_event) = OptionFuture::from(
-                            manager.current.as_mut().map(|cur_build| cur_build.build_channel.recv())
-                        ) => {
-                            use broadcast::error::RecvError;
+                        let current = manager
+                            .current
+                            .as_mut()
+                            .expect("No ongoing build while build event received. This is a bug!");
+                        match build_event {
+                            Ok(event) => current.info.log.log_event(event),
+                            Err(RecvError::Lagged(_)) => {},
+                            // Build finished
+                            Err(RecvError::Closed) => {
+                                if manager.last.is_none() {
+                                    println!("Server initialized: first build complete at {id}", id = current.info.id);
+                                }
 
-                            let current = manager
-                                .current
-                                .as_mut()
-                                .expect("No ongoing build while build event received. This is a bug!");
-                            match build_event {
-                                Ok(event) => current.info.log.log_event(event),
-                                Err(RecvError::Lagged(_)) => {},
-                                // Build finished
-                                Err(RecvError::Closed) => {
-                                    if manager.last.is_none() {
-                                        println!("Server initialized: first build complete at {id}", id = current.info.id);
-                                    }
-
-                                    manager.last = Some(LastBuild {
-                                        id: current.info.id,
-                                        timestamp: Local::now(),
-                                    });
-                                    current.info.log.dump(config.build_subdirectory_of(current.info.id));
-                                    manager.current = None;
-                                },
-                            };
-                        },
-                    }
+                                manager.last = Some(LastBuild {
+                                    id: current.info.id,
+                                    timestamp: Local::now(),
+                                });
+                                current.info.log.dump(config.build_subdirectory_of(current.info.id));
+                                manager.current = None;
+                            },
+                        };
+                    },
                 }
-            });
+            }
         });
 
         Ok(sender)
@@ -108,7 +98,6 @@ impl BuildManager {
 pub struct RunContext<'env> {
     manager: &'env mut BuildManager,
     config: Arc<WatcherConfig>,
-    local_set: &'env LocalSet,
 }
 
 pub trait RunnableRequest: Sized {
@@ -164,7 +153,7 @@ impl RunnableRequest for StartBuild {
                 let id = build_info.id;
 
                 let (tx, rx) = broadcast::channel(BROADCAST_CHANNEL_SIZE);
-                ctx.local_set.spawn_local(async move {
+                spawn(async move {
                     build(id, tx, ctx.config).await;
                 });
 
